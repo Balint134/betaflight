@@ -132,6 +132,8 @@ typedef struct pidProfile_s {
     uint8_t crash_recovery_rate;            // degree/second
     uint8_t vbatPidCompensation;            // Scale PIDsum to battery voltage
     uint8_t feedForwardTransition;          // Feed forward weight transition
+    uint16_t feedForwardScale;              // Temporary variable to define FF stick deflection scale
+    uint8_t feedForwardExpo;                // Expo for FeedForward to control the non-linearity of the FF curve 0 means the curve is linear
     uint16_t crash_limit_yaw;               // limits yaw errorRate, so crashes don't cause huge throttle increase
     uint16_t itermLimit;
     uint16_t dterm_lowpass2_hz;             // Extra PT1 Filter on D in hz

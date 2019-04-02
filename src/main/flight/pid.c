@@ -149,6 +149,8 @@ void resetPidProfile(pidProfile_t *pidProfile)
         .pidAtMinThrottle = PID_STABILISATION_ON,
         .levelAngleLimit = 55,
         .feedForwardTransition = 0,
+        .feedForwardExpo = 0,
+        .feedForwardScale = 1000,
         .yawRateAccelLimit = 0,
         .rateAccelLimit = 0,
         .itermThrottleThreshold = 250,
@@ -253,6 +255,7 @@ typedef union dtermLowpass_u {
 } dtermLowpass_t;
 
 static FAST_RAM_ZERO_INIT float previousPidSetpoint[XYZ_AXIS_COUNT];
+static FAST_RAM_ZERO_INIT float previousStickDeflection[XYZ_AXIS_COUNT];
 
 static FAST_RAM_ZERO_INIT filterApplyFnPtr dtermNotchApplyFn;
 static FAST_RAM_ZERO_INIT biquadFilter_t dtermNotch[XYZ_AXIS_COUNT];
@@ -286,8 +289,9 @@ static FAST_RAM_ZERO_INIT pt1Filter_t dMinLowpass[XYZ_AXIS_COUNT];
 #endif
 
 #ifdef USE_RC_SMOOTHING_FILTER
-static FAST_RAM_ZERO_INIT pt1Filter_t setpointDerivativePt1[XYZ_AXIS_COUNT];
-static FAST_RAM_ZERO_INIT biquadFilter_t setpointDerivativeBiquad[XYZ_AXIS_COUNT];
+// Two sets of setpoint filters for setpoint rates and setpoint stick deflection
+static FAST_RAM_ZERO_INIT pt1Filter_t setpointDerivativePt1[XYZ_AXIS_COUNT * 2];
+static FAST_RAM_ZERO_INIT biquadFilter_t setpointDerivativeBiquad[XYZ_AXIS_COUNT * 2];
 static FAST_RAM_ZERO_INIT bool setpointDerivativeLpfInitialized;
 static FAST_RAM_ZERO_INIT uint8_t rcSmoothingDebugAxis;
 static FAST_RAM_ZERO_INIT uint8_t rcSmoothingFilterType;
@@ -445,7 +449,7 @@ void pidInitSetpointDerivativeLpf(uint16_t filterCutoff, uint8_t debugAxis, uint
     rcSmoothingFilterType = filterType;
     if ((filterCutoff > 0) && (rcSmoothingFilterType != RC_SMOOTHING_DERIVATIVE_OFF)) {
         setpointDerivativeLpfInitialized = true;
-        for (int axis = FD_ROLL; axis <= FD_YAW; axis++) {
+        for (int axis = 0; axis < XYZ_AXIS_COUNT * 2; axis++) {
             switch (rcSmoothingFilterType) {
                 case RC_SMOOTHING_DERIVATIVE_PT1:
                     pt1FilterInit(&setpointDerivativePt1[axis], pt1FilterGain(filterCutoff, dT));
@@ -461,7 +465,7 @@ void pidInitSetpointDerivativeLpf(uint16_t filterCutoff, uint8_t debugAxis, uint
 void pidUpdateSetpointDerivativeLpf(uint16_t filterCutoff)
 {
     if ((filterCutoff > 0) && (rcSmoothingFilterType != RC_SMOOTHING_DERIVATIVE_OFF)) {
-        for (int axis = FD_ROLL; axis <= FD_YAW; axis++) {
+        for (int axis = 0; axis < XYZ_AXIS_COUNT * 2; axis++) {
             switch (rcSmoothingFilterType) {
                 case RC_SMOOTHING_DERIVATIVE_PT1:
                     pt1FilterUpdateCutoff(&setpointDerivativePt1[axis], pt1FilterGain(filterCutoff, dT));
@@ -485,6 +489,7 @@ typedef struct pidCoefficient_s {
 static FAST_RAM_ZERO_INIT pidCoefficient_t pidCoefficient[XYZ_AXIS_COUNT];
 static FAST_RAM_ZERO_INIT float maxVelocity[XYZ_AXIS_COUNT];
 static FAST_RAM_ZERO_INIT float feedForwardTransition;
+static FAST_RAM_ZERO_INIT float feedForwardExpo;
 static FAST_RAM_ZERO_INIT float levelGain, horizonGain, horizonTransition, horizonCutoffDegrees, horizonFactorRatio;
 static FAST_RAM_ZERO_INIT float itermWindupPointInv;
 static FAST_RAM_ZERO_INIT uint8_t horizonTiltExpertMode;
@@ -569,6 +574,8 @@ void pidInitConfig(const pidProfile_t *pidProfile)
     } else {
         feedForwardTransition = 100.0f / pidProfile->feedForwardTransition;
     }
+    feedForwardExpo = 1.0f + pidProfile->feedForwardExpo / 100.0;
+
     for (int axis = FD_ROLL; axis <= FD_YAW; axis++) {
         pidCoefficient[axis].Kp = PTERM_SCALE * pidProfile->pid[axis].P;
         pidCoefficient[axis].Ki = ITERM_SCALE * pidProfile->pid[axis].I;
@@ -1215,6 +1222,30 @@ static float applyLaunchControl(int axis, const rollAndPitchTrims_t *angleTrim)
 }
 #endif
 
+// Applies DMin and returns the DMin coefficient or 1.0f if DMin is disabled
+float applyDMin(int axis, float pidSetpointDelta, const float delta) {
+    float dMinFactor = 1.0f;
+#if defined(USE_D_MIN)
+    if (dMinPercent[axis] > 0) {
+        float dMinGyroFactor = biquadFilterApply(&dMinRange[axis], delta);
+        dMinGyroFactor = fabsf(dMinGyroFactor) * dMinGyroGain;
+        const float dMinSetpointFactor = (fabsf(pidSetpointDelta)) * dMinSetpointGain;
+        dMinFactor = MAX(dMinGyroFactor, dMinSetpointFactor);
+        dMinFactor = dMinPercent[axis] + (1.0f - dMinPercent[axis]) * dMinFactor;
+        dMinFactor = pt1FilterApply(&dMinLowpass[axis], dMinFactor);
+        dMinFactor = MIN(dMinFactor, 1.0f);
+        if (axis == FD_ROLL) {
+            DEBUG_SET(DEBUG_D_MIN, 0, lrintf(dMinGyroFactor * 100));
+            DEBUG_SET(DEBUG_D_MIN, 1, lrintf(dMinSetpointFactor * 100));
+            DEBUG_SET(DEBUG_D_MIN, 2, lrintf(pidCoefficient[axis].Kd * dMinFactor * 10 / DTERM_SCALE));
+        } else if (axis == FD_PITCH) {
+            DEBUG_SET(DEBUG_D_MIN, 3, lrintf(pidCoefficient[axis].Kd * dMinFactor * 10 / DTERM_SCALE));
+        }
+    }
+#endif
+    return dMinFactor;
+}
+
 // Betaflight pid controller, which will be maintained in the future with additional features specialised for current (mini) multirotor usage.
 // Based on 2DOF reference design (matlab)
 void FAST_CODE pidController(const pidProfile_t *pidProfile, timeUs_t currentTimeUs)
@@ -1389,34 +1420,14 @@ void FAST_CODE pidController(const pidProfile_t *pidProfile, timeUs_t currentTim
             // This is done to avoid DTerm spikes that occur with dynamically
             // calculated deltaT whenever another task causes the PID
             // loop execution to be delayed.
-            const float delta =
-                - (gyroRateDterm[axis] - previousGyroRateDterm[axis]) * pidFrequency;
+            const float delta = - (gyroRateDterm[axis] - previousGyroRateDterm[axis]) * pidFrequency;
 
 #if defined(USE_ACC)
             if (cmpTimeUs(currentTimeUs, levelModeStartTimeUs) > CRASH_RECOVERY_DETECTION_DELAY_US) {
                 detectAndSetCrashRecovery(pidProfile->crash_recovery, axis, currentTimeUs, delta, errorRate);
             }
 #endif
-
-            float dMinFactor = 1.0f;
-#if defined(USE_D_MIN)
-            if (dMinPercent[axis] > 0) {
-                float dMinGyroFactor = biquadFilterApply(&dMinRange[axis], delta);
-                dMinGyroFactor = fabsf(dMinGyroFactor) * dMinGyroGain;
-                const float dMinSetpointFactor = (fabsf(pidSetpointDelta)) * dMinSetpointGain;
-                dMinFactor = MAX(dMinGyroFactor, dMinSetpointFactor);
-                dMinFactor = dMinPercent[axis] + (1.0f - dMinPercent[axis]) * dMinFactor;
-                dMinFactor = pt1FilterApply(&dMinLowpass[axis], dMinFactor);
-                dMinFactor = MIN(dMinFactor, 1.0f);
-                if (axis == FD_ROLL) {
-                    DEBUG_SET(DEBUG_D_MIN, 0, lrintf(dMinGyroFactor * 100));
-                    DEBUG_SET(DEBUG_D_MIN, 1, lrintf(dMinSetpointFactor * 100));
-                    DEBUG_SET(DEBUG_D_MIN, 2, lrintf(pidCoefficient[axis].Kd * dMinFactor * 10 / DTERM_SCALE));
-                } else if (axis == FD_PITCH) {
-                    DEBUG_SET(DEBUG_D_MIN, 3, lrintf(pidCoefficient[axis].Kd * dMinFactor * 10 / DTERM_SCALE));
-                }
-            }
-#endif
+            float dMinFactor = applyDMin(axis, pidSetpointDelta, delta);
             pidData[axis].D = pidCoefficient[axis].Kd * delta * tpaFactor * dMinFactor;
         } else {
             pidData[axis].D = 0;
@@ -1427,9 +1438,20 @@ void FAST_CODE pidController(const pidProfile_t *pidProfile, timeUs_t currentTim
         // Only enable feedforward for rate mode and if launch control is inactive
         const float feedforwardGain = (flightModeFlags || launchControlActive) ? 0.0f : pidCoefficient[axis].Kf;
         if (feedforwardGain > 0) {
+            // Get stick deflection and apply FF expo
+            float stickDeflection = getRcDeflection(axis);
+            stickDeflection = SIGN(stickDeflection) * powf(ABS(stickDeflection), feedForwardExpo) * pidProfile->feedForwardScale;
+            // Calculate stick deflection velocity
+            float deltaStickDeflection = stickDeflection - previousStickDeflection[axis];
+            previousStickDeflection[axis] = stickDeflection;
+
+#ifdef USE_RC_SMOOTHING_FILTER
+            // Deflection based filters are stored in the upper half of the filter array, thus they're offset by 3
+            deltaStickDeflection = applyRcSmoothingDerivativeFilter(axis + XYZ_AXIS_COUNT, deltaStickDeflection);
+#endif
             // no transition if feedForwardTransition == 0
-            float transition = feedForwardTransition > 0 ? MIN(1.f, getRcDeflectionAbs(axis) * feedForwardTransition) : 1;
-            pidData[axis].F = feedforwardGain * transition * pidSetpointDelta * pidFrequency;
+            const float transition = feedForwardTransition > 0 ? MIN(1.f, getRcDeflectionAbs(axis) * feedForwardTransition) : 1;
+            pidData[axis].F = feedforwardGain * transition * deltaStickDeflection * pidFrequency;
 
 #if defined(USE_SMART_FEEDFORWARD)
             applySmartFeedforward(axis);
