@@ -33,6 +33,8 @@
 
 // Use floating point M_PI instead explicitly.
 #define M_PIf       3.14159265358979323846f
+// Euler number as floating point number
+#define M_Ef        2.71828182845904523536f
 
 #define RAD    (M_PIf / 180.0f)
 #define DEGREES_TO_DECIDEGREES(angle) ((angle) * 10)
@@ -54,6 +56,9 @@
 #define ABS(x) \
   __extension__ ({ __typeof__ (x) _x = (x); \
   _x > 0 ? _x : -_x; })
+#define SIGN(x) \
+  __extension__ ({ __typeof__ (x) _x = (x); \
+  _x > 0 ? 1.0f : -1.0f; })
 
 #define Q12 (1 << 12)
 

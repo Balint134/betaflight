@@ -150,6 +150,8 @@ void resetPidProfile(pidProfile_t *pidProfile)
         .pidAtMinThrottle = PID_STABILISATION_ON,
         .levelAngleLimit = 55,
         .feedForwardTransition = 0,
+        .setpointWeightScale = 5,
+        .setpointWeightMaxError = 35,
         .yawRateAccelLimit = 0,
         .rateAccelLimit = 0,
         .itermThrottleThreshold = 250,
@@ -253,6 +255,7 @@ typedef union dtermLowpass_u {
 } dtermLowpass_t;
 
 static FAST_RAM_ZERO_INIT float previousPidSetpoint[XYZ_AXIS_COUNT];
+static FAST_RAM_ZERO_INIT float previousErrorRate[XYZ_AXIS_COUNT];
 
 static FAST_RAM_ZERO_INIT filterApplyFnPtr dtermNotchApplyFn;
 static FAST_RAM_ZERO_INIT biquadFilter_t dtermNotch[XYZ_AXIS_COUNT];
@@ -946,7 +949,7 @@ static FAST_CODE_NOINLINE float applyAcroTrainer(int axis, const rollAndPitchTri
         if (acroTrainerAxisState[axis] != 0) {
             ret = constrainf(((acroTrainerAngleLimit * angleSign) - currentAngle) * acroTrainerGain, -ACRO_TRAINER_SETPOINT_LIMIT, ACRO_TRAINER_SETPOINT_LIMIT);
         } else {
-        
+
         // Not currently over the limit so project the angle based on current angle and
         // gyro angular rate using a sliding window based on gyro rate (faster rotation means larger window.
         // If the projected angle exceeds the limit then apply limiting to minimize overshoot.
@@ -963,7 +966,7 @@ static FAST_CODE_NOINLINE float applyAcroTrainer(int axis, const rollAndPitchTri
         if (resetIterm) {
             pidData[axis].I = 0;
         }
- 
+
         if (axis == acroTrainerDebugAxis) {
             DEBUG_SET(DEBUG_ACRO_TRAINER, 0, lrintf(currentAngle * 10.0f));
             DEBUG_SET(DEBUG_ACRO_TRAINER, 1, acroTrainerAxisState[axis]);
@@ -1330,18 +1333,25 @@ void FAST_CODE pidController(const pidProfile_t *pidProfile, timeUs_t currentTim
 #if defined(USE_ITERM_RELAX)
         if (!launchControlActive && !inCrashRecoveryMode) {
             applyItermRelax(axis, previousIterm, gyroRate, &itermErrorRate, &currentPidSetpoint);
-            errorRate = currentPidSetpoint - gyroRate;
         }
 #endif
 
         // --------low-level gyro-based PID based on 2DOF PID controller. ----------
         // 2-DOF PID controller with optional filter on derivative term.
-        // b = 1 and only c (feedforward weight) can be tuned (amount derivative on measurement or error).
 
         // -----calculate P component
-        pidData[axis].P = pidCoefficient[axis].Kp * errorRate * tpaFactorKp;
+        const float normalizedErrorDelta = constrainf(SIGN(currentPidSetpoint) * (errorRate - previousErrorRate[axis]) / (float) pidProfile->setpointWeightMaxError, -1.0f, 1.0f);
+        previousErrorRate[axis] = errorRate;
+
+        const float setpointWeight = 1.0f / (1.0f + powf(M_Ef, -(pidProfile->setpointWeightScale * normalizedErrorDelta)));
+        pidData[axis].P = pidCoefficient[axis].Kp * (setpointWeight * currentPidSetpoint - gyroRate) * tpaFactorKp;
+
         if (axis == FD_YAW) {
             pidData[axis].P = ptermYawLowpassApplyFn((filter_t *) &ptermYawLowpass, pidData[axis].P);
+        }
+        if (axis == FD_ROLL) {
+            DEBUG_SET(DEBUG_D_MIN, 0, lrintf(normalizedErrorDelta * 100));
+            DEBUG_SET(DEBUG_D_MIN, 1, lrintf(setpointWeight * 100));
         }
 
         // -----calculate I component
@@ -1390,13 +1400,13 @@ void FAST_CODE pidController(const pidProfile_t *pidProfile, timeUs_t currentTim
                 dMinFactor = dMinPercent[axis] + (1.0f - dMinPercent[axis]) * dMinFactor;
                 dMinFactor = pt1FilterApply(&dMinLowpass[axis], dMinFactor);
                 dMinFactor = MIN(dMinFactor, 1.0f);
-                if (axis == FD_ROLL) {
-                    DEBUG_SET(DEBUG_D_MIN, 0, lrintf(dMinGyroFactor * 100));
-                    DEBUG_SET(DEBUG_D_MIN, 1, lrintf(dMinSetpointFactor * 100));
-                    DEBUG_SET(DEBUG_D_MIN, 2, lrintf(pidCoefficient[axis].Kd * dMinFactor * 10 / DTERM_SCALE));
-                } else if (axis == FD_PITCH) {
-                    DEBUG_SET(DEBUG_D_MIN, 3, lrintf(pidCoefficient[axis].Kd * dMinFactor * 10 / DTERM_SCALE));
-                }
+//                if (axis == FD_ROLL) {
+//                    DEBUG_SET(DEBUG_D_MIN, 0, lrintf(dMinGyroFactor * 100));
+//                    DEBUG_SET(DEBUG_D_MIN, 1, lrintf(dMinSetpointFactor * 100));
+//                    DEBUG_SET(DEBUG_D_MIN, 2, lrintf(pidCoefficient[axis].Kd * dMinFactor * 10 / DTERM_SCALE));
+//                } else if (axis == FD_PITCH) {
+//                    DEBUG_SET(DEBUG_D_MIN, 3, lrintf(pidCoefficient[axis].Kd * dMinFactor * 10 / DTERM_SCALE));
+//                }
             }
 #endif
             pidData[axis].D = pidCoefficient[axis].Kd * delta * tpaFactor * dMinFactor;
